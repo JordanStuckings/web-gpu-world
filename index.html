@@ -1,16 +1,328 @@
-<!DOCTYPE html>
-<html>
+<!DOCTYPE html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>WebGPU 3rd-Person (iOS-friendly)</title>
+<style>
+  html,body{margin:0;height:100svh;width:100vw;overflow:hidden;background:#000;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+  canvas{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none}
+  #hud{position:fixed;left:8px;top:calc(8px + env(safe-area-inset-top));right:8px;pointer-events:none}
+  #status{font:12px/1.35 system-ui;white-space:pre-wrap;background:rgba(0,0,0,.55);color:#e6eefb;border-radius:10px;padding:10px}
+</style>
+<canvas id="gfx"></canvas><div id="hud"><div id="status">boot…</div></div>
+<script>
+(async()=>{
+  const hud = document.getElementById('status');
+  const canvas = document.getElementById('gfx'); canvas.tabIndex=0; canvas.focus();
 
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width">
-  <title>replit</title>
-  <link href="style.css" rel="stylesheet" type="text/css" />
-</head>
+  const log = (s)=> hud.textContent = s;
 
-<body>
-  Hello world
-  <script src="script.js"></script>
-</body>
+  if(!('gpu' in navigator)){ log('No WebGPU'); return; }
+  const adapter = await navigator.gpu.requestAdapter(); if(!adapter){ log('No adapter'); return; }
+  const device  = await adapter.requestDevice();
+  const context = canvas.getContext('webgpu');
 
-</html>
+  // --- choose a canvas format (use the same set that worked for you in the tester)
+  const combos = [
+    {fmt: navigator.gpu.getPreferredCanvasFormat(), alpha:'opaque', name:'preferred/opaque'},
+    {fmt: 'bgra8unorm', alpha:'opaque', name:'bgra8/opaque'},
+    {fmt: 'rgba8unorm', alpha:'opaque', name:'rgba8/opaque'},
+    {fmt: navigator.gpu.getPreferredCanvasFormat(), alpha:'premultiplied', name:'preferred/premult'},
+    {fmt: 'bgra8unorm', alpha:'premultiplied', name:'bgra8/premult'},
+    {fmt: 'rgba8unorm', alpha:'premultiplied', name:'rgba8/premult'},
+  ];
+  let chosen = combos[0];
+
+  // --- size + configure (configure happens inside resize on iOS to avoid black)
+  let aspect = 1;
+  const depthFormat = 'depth24plus';
+  let depthTex = null;
+
+  function configure() {
+    context.configure({ device, format: chosen.fmt, alphaMode: chosen.alpha });
+    depthTex = device.createTexture({
+      size: { width: canvas.width, height: canvas.height, depthOrArrayLayers: 1 },
+      format: depthFormat,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+  }
+
+  function resize() {
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    canvas.width  = Math.max(1, (canvas.clientWidth  * dpr) | 0);
+    canvas.height = Math.max(1, (canvas.clientHeight * dpr) | 0);
+    aspect = canvas.width / canvas.height;
+    // IMPORTANT: configure AFTER width/height are set
+    try { configure(); } catch(e) {
+      // fall back through combos until one configures
+      for (const c of combos) {
+        try { context.configure({ device, format: c.fmt, alphaMode: c.alpha }); chosen = c; break; } catch(_){}
+      }
+      // rebuild depth after any reconfigure
+      depthTex = device.createTexture({
+        size: { width: canvas.width, height: canvas.height, depthOrArrayLayers: 1 },
+        format: depthFormat, usage: GPUTextureUsage.RENDER_ATTACHMENT
+      });
+    }
+  }
+  new ResizeObserver(resize).observe(canvas);
+  resize(); // do it once up front
+
+  // --- WGSL (use vec4 in UBOs to avoid padding gotchas)
+  const shader = /* wgsl */`
+struct Globals { viewProj: mat4x4<f32>, light: vec4<f32> };
+struct ObjectU { model:   mat4x4<f32>, color: vec4<f32> };
+
+@group(0) @binding(0) var<uniform> G: Globals;
+@group(1) @binding(0) var<uniform> O: ObjectU;
+
+struct VOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) N: vec3<f32>,
+};
+
+@vertex
+fn vs(@location(0) P: vec3<f32>, @location(1) N: vec3<f32>) -> VOut {
+  var o: VOut;
+  let wp = O.model * vec4<f32>(P, 1.0);
+  o.pos = G.viewProj * wp;
+  o.N = normalize((O.model * vec4<f32>(N, 0.0)).xyz);
+  return o;
+}
+
+@fragment
+fn fs(@location(0) N: vec3<f32>) -> @location(0) vec4<f32> {
+  let n = normalize(N);
+  let l = normalize(-G.light.xyz);
+  let d = max(dot(n, l), 0.1);
+  return vec4<f32>(O.color.xyz * d, 1.0);
+}
+`;
+
+  const module = device.createShaderModule({ code: shader });
+  const pipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex: {
+      module, entryPoint: 'vs',
+      buffers: [{ arrayStride: 24, attributes: [
+        { shaderLocation: 0, format: 'float32x3', offset: 0 },
+        { shaderLocation: 1, format: 'float32x3', offset: 12 },
+      ]}]
+    },
+    fragment: { module, entryPoint: 'fs', targets: [{ format: chosen.fmt }] },
+    primitive: { topology: 'triangle-list', cullMode: 'back' },
+    depthStencil: { format: depthFormat, depthWriteEnabled: true, depthCompare: 'less' },
+  });
+
+  // --- geometry
+  function plane(S=300){const s=S/2;
+    const P=new Float32Array([-s,0,-s, s,0,-s, s,0,s, -s,0,s]);
+    const N=new Float32Array([0,1,0, 0,1,0, 0,1,0, 0,1,0]);
+    const I=new Uint16Array([0,1,2, 0,2,3]); return {P,N,I};
+  }
+  function box(w=1,h=2,d=1){
+    const x=w/2,y=h/2,z=d/2,p=[],n=[],idx=[];
+    const faces=[[1,0,0, x,-y,-z, x,y,-z, x,y,z, x,-y,z],
+                 [-1,0,0,-x,-y,z,-x,y,z,-x,y,-z,-x,-y,-z],
+                 [0,1,0,-x,y,z, x,y,z, x,y,-z, -x,y,-z],
+                 [0,-1,0,-x,-y,-z, x,-y,-z, x,-y,z, -x,-y,z],
+                 [0,0,1,-x,-y,z, x,-y,z, x,y,z, -x,y,z],
+                 [0,0,-1, x,-y,-z,-x,-y,-z,-x,y,-z, x,y,-z]];
+    for(let f=0;f<6;f++){const base=f*4,[nx,ny,nz,...v]=faces[f];
+      for(let i=0;i<4;i++){p.push(v[i*3],v[i*3+1],v[i*3+2]); n.push(nx,ny,nz);}
+      idx.push(base,base+1,base+2, base,base+2,base+3);}
+    return {P:new Float32Array(p),N:new Float32Array(n),I:new Uint16Array(idx)};
+  }
+  function mesh(g){
+    const verts = new Float32Array((g.P.length/3)*6);
+    for(let i=0;i<g.P.length/3;i++){
+      verts.set(g.P.subarray(i*3,i*3+3), i*6);
+      verts.set(g.N.subarray(i*3,i*3+3), i*6+3);
+    }
+    const vb=device.createBuffer({size:verts.byteLength,usage:GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST});
+    device.queue.writeBuffer(vb,0,verts);
+    const ib=device.createBuffer({size:g.I.byteLength,usage:GPUBufferUsage.INDEX|GPUBufferUsage.COPY_DST});
+    device.queue.writeBuffer(ib,0,g.I);
+    return {vb,ib,count:g.I.length};
+  }
+  const ground = mesh(plane(300));
+  const hero   = mesh(box(1,2,1));
+
+  // --- uniforms (use vec4 in both structs)
+  const U = (16 + 4) * 4; // mat4 (16f) + vec4 (4f) = 20 floats * 4B
+  const gBuf = device.createBuffer({ size: U, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const oGround = device.createBuffer({ size: U, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const oHero   = device.createBuffer({ size: U, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+  const bgG  = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries:[{binding:0,resource:{buffer:gBuf}}] });
+  const bgOG = device.createBindGroup({ layout: pipeline.getBindGroupLayout(1), entries:[{binding:0,resource:{buffer:oGround}}] });
+  const bgOH = device.createBindGroup({ layout: pipeline.getBindGroupLayout(1), entries:[{binding:0,resource:{buffer:oHero  }}] });
+
+  function writeGlobals(viewProj, light=[0.45,0.85,0.35,0]){
+    const d=new Float32Array(20); d.set(viewProj,0); d.set(light,16);
+    device.queue.writeBuffer(gBuf,0,d);
+  }
+  function writeObj(buf, model, color=[0.85,0.70,0.25,0]){
+    const d=new Float32Array(20); d.set(model,0); d.set(color,16);
+    device.queue.writeBuffer(buf,0,d);
+  }
+  writeObj(oGround, new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]), [0.25,0.65,0.35,0]);
+
+  // --- tiny mat4
+  function I4(){return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);}
+  function mul(o,a,b){
+    const A=a,B=b;
+    o[0]=A[0]*B[0]+A[4]*B[1]+A[8]*B[2]+A[12]*B[3];
+    o[1]=A[1]*B[0]+A[5]*B[1]+A[9]*B[2]+A[13]*B[3];
+    o[2]=A[2]*B[0]+A[6]*B[1]+A[10]*B[2]+A[14]*B[3];
+    o[3]=A[3]*B[0]+A[7]*B[1]+A[11]*B[2]+A[15]*B[3];
+    o[4]=A[0]*B[4]+A[4]*B[5]+A[8]*B[6]+A[12]*B[7];
+    o[5]=A[1]*B[4]+A[5]*B[5]+A[9]*B[6]+A[13]*B[7];
+    o[6]=A[2]*B[4]+A[6]*B[5]+A[10]*B[6]+A[14]*B[7];
+    o[7]=A[3]*B[4]+A[7]*B[5]+A[11]*B[6]+A[15]*B[7];
+    o[8]=A[0]*B[8]+A[4]*B[9]+A[8]*B[10]+A[12]*B[11];
+    o[9]=A[1]*B[8]+A[5]*B[9]+A[9]*B[10]+A[13]*B[11];
+    o[10]=A[2]*B[8]+A[6]*B[9]+A[10]*B[10]+A[14]*B[11];
+    o[11]=A[3]*B[8]+A[7]*B[9]+A[11]*B[10]+A[15]*B[11];
+    o[12]=A[0]*B[12]+A[4]*B[13]+A[8]*B[14]+A[12]*B[15];
+    o[13]=A[1]*B[12]+A[5]*B[13]+A[9]*B[14]+A[13]*B[15];
+    o[14]=A[2]*B[12]+A[6]*B[13]+A[10]*B[14]+A[14]*B[15];
+    o[15]=A[3]*B[12]+A[7]*B[13]+A[11]*B[14]+A[15]*B[15]; return o;
+  }
+  function persp(o,fovy,asp,n,f){
+    const q=1/Math.tan(fovy/2);
+    o[0]=q/asp;o[1]=0;o[2]=0;o[3]=0; o[4]=0;o[5]=q;o[6]=0;o[7]=0;
+    o[8]=0;o[9]=0;o[10]=f/(n-f);o[11]=-1; o[12]=0;o[13]=0;o[14]=(f*n)/(n-f);o[15]=0; return o;
+  }
+  function lookAt(o,eye,ctr,up){
+    let zx=eye[0]-ctr[0],zy=eye[1]-ctr[1],zz=eye[2]-ctr[2];
+    const zl=Math.hypot(zx,zy,zz)||1; zx/=zl; zy/=zl; zz/=zl;
+    let rx=up[1]*zz-up[2]*zy, ry=up[2]*zx-up[0]*zz, rz=up[0]*zy-up[1]*zx;
+    const rl=Math.hypot(rx,ry,rz)||1; rx/=rl; ry/=rl; rz/=rl;
+    const ux=zy*rz-zz*ry, uy=zz*rx-zx*rz, uz=zx*ry-zy*rx;
+    o[0]=rx;o[1]=ux;o[2]=zx;o[3]=0; o[4]=ry;o[5]=uy;o[6]=zy;o[7]=0; o[8]=rz;o[9]=uz;o[10]=zz;o[11]=0;
+    o[12]=-(rx*eye[0]+ry*eye[1]+rz*eye[2]);
+    o[13]=-(ux*eye[0]+uy*eye[1]+uz*eye[2]);
+    o[14]=-(zx*eye[0]+zy*eye[1]+zz*eye[2]); o[15]=1; return o;
+  }
+  function yRot(o,r){const c=Math.cos(r),s=Math.sin(r);
+    o[0]=c;o[1]=0;o[2]=s;o[3]=0; o[4]=0;o[5]=1;o[6]=0;o[7]=0;
+    o[8]=-s;o[9]=0;o[10]=c;o[11]=0; o[12]=0;o[13]=0;o[14]=0;o[15]=1; return o;
+  }
+  function trans(o,v){o.set([1,0,0,0, 0,1,0,0, 0,0,1,0, v[0],v[1],v[2],1]); return o;}
+
+  // --- scene & input
+  let camYaw=0, camPitch=0.35, camDist=6;
+  const charPos=new Float32Array([0,1,0]);
+  const charVel=new Float32Array([0,0,0]);
+  let charYaw=0;
+  const gravity=-18, run=5, jump=7.5;
+
+  let leftId=null, rightId=null, joyCenter=[0,0], moveX=0, moveY=0, lastLook=[0,0], lastTap=0;
+  function toXY(e){const r=canvas.getBoundingClientRect();return [e.clientX-r.left,e.clientY-r.top];}
+  canvas.addEventListener('pointerdown',e=>{
+    e.preventDefault(); canvas.setPointerCapture?.(e.pointerId);
+    const [x]=toXY(e); const half=canvas.clientWidth/2; const now=performance.now();
+    if(now-lastTap<300) tryJump(); lastTap=now;
+    if(x<half && leftId===null){ leftId=e.pointerId; const p=toXY(e); joyCenter=p; updateJoy(p[0],p[1]); }
+    else if(rightId===null){ rightId=e.pointerId; lastLook=toXY(e); }
+    else if(leftId===null){ leftId=e.pointerId; const p=toXY(e); joyCenter=p; updateJoy(p[0],p[1]); }
+  },{passive:false});
+  canvas.addEventListener('pointermove',e=>{
+    if(e.pointerId!==leftId && e.pointerId!==rightId) return; const [x,y]=toXY(e);
+    if(e.pointerId===leftId) updateJoy(x,y);
+    else { const dx=x-lastLook[0], dy=y-lastLook[1]; lastLook=[x,y]; const s=0.006; camYaw-=dx*s; camPitch-=dy*s; camPitch=Math.max(-1.2,Math.min(1.2,camPitch)); }
+  });
+  canvas.addEventListener('pointerup',e=>{
+    if(e.pointerId===leftId){ leftId=null; moveX=moveY=0; }
+    if(e.pointerId===rightId){ rightId=null; }
+    canvas.releasePointerCapture?.(e.pointerId);
+  });
+  function updateJoy(x,y){
+    const max=Math.max(48,Math.min(96,canvas.clientWidth*0.08));
+    const dx=x-joyCenter[0], dy=y-joyCenter[1];
+    let m=Math.hypot(dx,dy); let ux=dx, uy=dy; if(m>max){ ux*=max/m; uy*=max/m; m=max; }
+    moveX  =(ux/max); moveY =(-uy/max);
+  }
+  const keys=new Set();
+  addEventListener('keydown',e=>{
+    const k=e.key.toLowerCase(); if(['w','a','s','d','arrowup','arrowdown','arrowleft','arrowright',' '].includes(k)){ e.preventDefault(); keys.add(k); }
+  },{passive:false});
+  addEventListener('keyup',e=>keys.delete(e.key.toLowerCase()));
+  function keysToMove(){
+    let x=0,y=0;
+    if(keys.has('w')||keys.has('arrowup')) y+=1;
+    if(keys.has('s')||keys.has('arrowdown')) y-=1;
+    if(keys.has('a')||keys.has('arrowleft')) x-=1;
+    if(keys.has('d')||keys.has('arrowright')) x+=1;
+    const L=Math.hypot(x,y)||1; x/=L; y/=L;
+    if(leftId===null){ moveX=x; moveY=y; }
+    if(keys.has(' ')) tryJump();
+  }
+  function tryJump(){ const grounded=Math.abs(charPos[1]-1)<0.002 && Math.abs(charVel[1])<0.05; if(grounded) charVel[1]=jump; }
+
+  // --- matrices
+  const proj=I4(), view=I4(), vp=I4(), model=I4(), R=I4(), T=I4();
+
+  function updateCamera(){
+    persp(proj, 50*Math.PI/180, aspect, 0.05, 500);
+    const cx=charPos[0], cy=charPos[1]+0.9, cz=charPos[2], r=camDist;
+    const ex=cx + r*Math.cos(camPitch)*Math.sin(camYaw);
+    const ey=cy + r*Math.sin(camPitch);
+    const ez=cz + r*Math.cos(camPitch)*Math.cos(camYaw);
+    lookAt(view,[ex,ey,ez],[cx,cy,cz],[0,1,0]); mul(vp,proj,view); writeGlobals(vp,[0.45,0.85,0.35,0]);
+  }
+  writeObj(oHero, I4(), [0.85,0.70,0.25,0]);
+
+  // --- main loop
+  let last=performance.now(), frames=0, fps=0, fpsT=0;
+  function loop(){
+    const now=performance.now(); let dt=(now-last)/1000; if(dt>0.05) dt=0.05; last=now;
+    frames++; fpsT+=dt; if(fpsT>=0.5){ fps=Math.round(frames/fpsT); frames=0; fpsT=0; }
+    keysToMove();
+
+    // movement
+    const fwd=[Math.sin(camYaw),0,Math.cos(camYaw)];
+    const rgt=[Math.cos(camYaw),0,-Math.sin(camYaw)];
+    let des=[ rgt[0]*moveX + fwd[0]*moveY, 0, rgt[2]*moveX + fwd[2]*moveY ];
+    const len=Math.hypot(des[0],des[2]); if(len>0){ des[0]/=len; des[2]/=len; }
+    const onGround = Math.abs(charPos[1]-1)<0.002 || charPos[1]<1+1e-3;
+    const sp = onGround ? run : run*0.6;
+    charVel[0]=des[0]*sp; charVel[2]=des[2]*sp; charVel[1]+=gravity*dt;
+    charPos[0]+=charVel[0]*dt; charPos[1]+=charVel[1]*dt; charPos[2]+=charVel[2]*dt;
+    if(charPos[1]<1){ charPos[1]=1; charVel[1]=0; }
+    if(len>0.001){ const target=Math.atan2(charVel[0],charVel[2]); const diff=((target-charYaw+Math.PI*3)%(Math.PI*2))-Math.PI; charYaw+=diff*Math.min(12*dt,1); }
+
+    updateCamera();
+    yRot(R,charYaw); trans(T,charPos); mul(model,T,R); writeObj(oHero, model, [0.85,0.70,0.25,0]);
+
+    // draw
+    const colorView = context.getCurrentTexture().createView();
+    const depthView = depthTex.createView();
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginRenderPass({
+      colorAttachments: [{ view: colorView, clearValue: {r:.58,g:.72,b:.92,a:1}, loadOp:'clear', storeOp:'store' }],
+      depthStencilAttachment: { view: depthView, depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' },
+    });
+
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bgG);
+
+    // ground
+    pass.setBindGroup(1, bgOG);
+    pass.setVertexBuffer(0, ground.vb);
+    pass.setIndexBuffer(ground.ib, 'uint16');
+    pass.drawIndexed(ground.count);
+
+    // hero
+    pass.setBindGroup(1, bgOH);
+    pass.setVertexBuffer(0, hero.vb);
+    pass.setIndexBuffer(hero.ib, 'uint16');
+    pass.drawIndexed(hero.count);
+
+    pass.end(); device.queue.submit([enc.finish()]);
+
+    log(`swap: ${chosen.fmt}/${chosen.alpha} • ${canvas.width}×${canvas.height} • FPS ${fps}`);
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
