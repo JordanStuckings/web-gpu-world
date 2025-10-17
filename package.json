@@ -4,9 +4,9 @@
   "type": "module",
   "description": "WebGPU 3D world with third-person character controls",
   "scripts": {
-    "dev": "python -m http.server 8000",
+    "dev": "node build-tools/watch.js",
     "build": "node build-tools/bundle.js",
-    "serve:dist": "python -m http.server 8001 --directory dist"
+    "open": "xdg-open dist/index.html"
   },
   "keywords": ["webgpu", "3d", "game"],
   "author": "",

@@ -14,28 +14,32 @@ export class CharacterPhysics {
   }
 
   update(dt, moveDir, camYaw) {
-    // Calculate movement direction in world space
-    const fwd = [Math.sin(camYaw), 0, Math.cos(camYaw)];
-    const rgt = [Math.cos(camYaw), 0, -Math.sin(camYaw)];
-
-    let desired = [
-      rgt[0] * moveDir.x + fwd[0] * moveDir.y,
-      0,
-      rgt[2] * moveDir.x + fwd[2] * moveDir.y
-    ];
-
-    const len = Math.hypot(desired[0], desired[2]);
-    if (len > 0) {
-      desired[0] /= len;
-      desired[2] /= len;
-    }
-
-    // Apply movement speed
+    // Check if on ground
     const onGround = Math.abs(this.position[1] - this.groundY) < 0.002 || this.position[1] < this.groundY + 1e-3;
-    const speed = onGround ? this.runSpeed : this.runSpeed * 0.6;
 
-    this.velocity[0] = desired[0] * speed;
-    this.velocity[2] = desired[2] * speed;
+    // Only update horizontal velocity when on ground (WoW-style momentum lock)
+    if (onGround) {
+      // Calculate movement direction in world space
+      const fwd = [-Math.sin(camYaw), 0, -Math.cos(camYaw)];
+      const rgt = [Math.cos(camYaw), 0, -Math.sin(camYaw)];
+
+      let desired = [
+        rgt[0] * moveDir.x + fwd[0] * moveDir.y,
+        0,
+        rgt[2] * moveDir.x + fwd[2] * moveDir.y
+      ];
+
+      const len = Math.hypot(desired[0], desired[2]);
+      if (len > 0) {
+        desired[0] /= len;
+        desired[2] /= len;
+      }
+
+      // Apply movement speed - only on ground
+      this.velocity[0] = desired[0] * this.runSpeed;
+      this.velocity[2] = desired[2] * this.runSpeed;
+    }
+    // When airborne, horizontal velocity is locked and doesn't change
 
     // Apply gravity
     this.velocity[1] += this.gravity * dt;
@@ -51,8 +55,9 @@ export class CharacterPhysics {
       this.velocity[1] = 0;
     }
 
-    // Rotate character to face movement direction
-    if (len > 0.001) {
+    // Rotate character to face movement direction (only when moving)
+    const horizontalSpeed = Math.hypot(this.velocity[0], this.velocity[2]);
+    if (horizontalSpeed > 0.001) {
       const target = Math.atan2(this.velocity[0], this.velocity[2]);
       const diff = ((target - this.yaw + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
       this.yaw += diff * Math.min(12 * dt, 1);
