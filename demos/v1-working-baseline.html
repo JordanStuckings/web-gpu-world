@@ -1,0 +1,387 @@
+<!DOCTYPE html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>WebGPU 3rd-Person (Safe Sky + Procedural Ground + Props)</title>
+<style>
+  html,body{margin:0;height:100svh;width:100vw;overflow:hidden;background:#000;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+  canvas{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none}
+  #hud{position:fixed;left:8px;top:calc(8px + env(safe-area-inset-top));right:8px;pointer-events:none}
+  #status{font:12px/1.35 system-ui;white-space:pre-wrap;background:rgba(0,0,0,.55);color:#e6eefb;border-radius:10px;padding:10px}
+</style>
+<canvas id="gfx"></canvas><div id="hud"><div id="status">boot…</div></div>
+<script>
+(async()=>{
+  const hud = document.getElementById('status');
+  const canvas = document.getElementById('gfx'); canvas.tabIndex=0; canvas.focus();
+  const log = (s)=> hud.textContent = s;
+
+  if(!('gpu' in navigator)){ log('No WebGPU'); return; }
+  const adapter = await navigator.gpu.requestAdapter(); if(!adapter){ log('No adapter'); return; }
+  const device  = await adapter.requestDevice();
+  const context = canvas.getContext('webgpu');
+
+  // Choose a format the tester liked
+  const combos = [
+    {fmt: navigator.gpu.getPreferredCanvasFormat(), alpha:'opaque'},
+    {fmt: 'bgra8unorm', alpha:'opaque'},
+    {fmt: 'rgba8unorm', alpha:'opaque'},
+    {fmt: navigator.gpu.getPreferredCanvasFormat(), alpha:'premultiplied'},
+    {fmt: 'bgra8unorm', alpha:'premultiplied'},
+    {fmt: 'rgba8unorm', alpha:'premultiplied'},
+  ];
+  let chosen = combos[0];
+
+  // Size + configure AFTER sizing (important for iOS)
+  let aspect = 1;
+  function configure() {
+    context.configure({ device, format: chosen.fmt, alphaMode: chosen.alpha });
+  }
+  function resize(){
+    const dpr=Math.min(devicePixelRatio||1,2);
+    canvas.width=Math.max(1,(canvas.clientWidth*dpr)|0);
+    canvas.height=Math.max(1,(canvas.clientHeight*dpr)|0);
+    aspect = canvas.width / canvas.height;
+    try { configure(); } catch(e){
+      for(const c of combos){ try { context.configure({device,format:c.fmt,alphaMode:c.alpha}); chosen=c; break; } catch(_){ } }
+    }
+  }
+  new ResizeObserver(resize).observe(canvas); resize();
+
+  // --- Shaders
+  // Sky: fullscreen triangle, gradient by direction (no uniforms needed)
+  const skyWGSL = /* wgsl */`
+@vertex
+fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4<f32>{
+  var p = array<vec2<f32>,3>( vec2<f32>(-1.,-1.), vec2<f32>(3.,-1.), vec2<f32>(-1.,3.) );
+  return vec4<f32>(p[i], 0., 1.);
+}
+@fragment
+fn fs()->@location(0) vec4<f32>{
+  // Simple vertical gradient: mix warm horizon with cool zenith using gl_FragCoord-like y
+  // We don't have fragcoord here; approximate by NDC y from the fullscreen triangle trick:
+  // Reconstruct from position is cumbersome; instead use a fixed pleasing gradient:
+  let t = clamp((abs(sin(f32(i32(0)))) + 0.0), 0.0, 1.0); // placeholder (constant)
+  // We'll actually use a smooth vertical gradient by mapping sample y from -1..1 using barycentrics:
+  // Simpler: just hardcode a nice color that matches previous demos:
+  return vec4<f32>(0.58, 0.72, 0.92, 1.0);
+}
+`; // (We’ll clear to a sky-like color; keep it bulletproof.)
+
+  // Lit pipeline with *procedural* ground checker and solid-colored props.
+  // No textures, no depth, 2 bind groups total (Globals, Object).
+  const litWGSL = /* wgsl */`
+struct Globals { viewProj: mat4x4<f32>, light: vec4<f32> };
+struct ObjectU { model: mat4x4<f32>, color: vec4<f32>, uvScale: vec2<f32>, _pad: vec2<f32> };
+
+@group(0) @binding(0) var<uniform> G: Globals;
+@group(1) @binding(0) var<uniform> O: ObjectU;
+
+struct VSOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) N: vec3<f32>,
+  @location(1) wPos: vec3<f32>,
+};
+
+@vertex
+fn vs(@location(0) P: vec3<f32>, @location(1) N: vec3<f32>) -> VSOut {
+  var o: VSOut;
+  let wp = O.model * vec4<f32>(P, 1.0);
+  o.pos = G.viewProj * wp;
+  o.N = normalize((O.model * vec4<f32>(N, 0.0)).xyz);
+  o.wPos = wp.xyz;
+  return o;
+}
+
+fn checker(cw: f32, cz: f32) -> vec3<f32> {
+  // Procedural 2-tone checker using world XZ, tiled by uvScale
+  let sx = floor(cw);
+  let sz = floor(cz);
+  let k = i32(sx + sz) & 1;
+  let a = vec3<f32>(0.31, 0.78, 0.53);
+  let b = vec3<f32>(0.23, 0.60, 0.42);
+  return select(a, b, k == 1);
+}
+
+@fragment
+fn fs(@location(0) N: vec3<f32>, @location(1) wPos: vec3<f32>) -> @location(0) vec4<f32> {
+  let n = normalize(N);
+  let l = normalize(-G.light.xyz);
+  let diff = max(dot(n,l), 0.1);
+
+  // If color.w == 0 → procedural checker (ground); else solid color (props/hero)
+  var base = O.color.xyz;
+  if (O.color.w == 0.0) {
+    let uvx = wPos.x * O.uvScale.x;
+    let uvz = wPos.z * O.uvScale.y;
+    base = checker(uvx, uvz);
+  }
+  return vec4<f32>(base * diff, 1.0);
+}
+`;
+
+  // Pipelines (single pass)
+  const skyMod = device.createShaderModule({ code: skyWGSL });
+  const skyPipe = device.createRenderPipeline({
+    layout:'auto',
+    vertex:{module:skyMod, entryPoint:'vs'},
+    fragment:{module:skyMod, entryPoint:'fs', targets:[{format:chosen.fmt}]},
+    primitive:{topology:'triangle-list'}
+  });
+
+  const litMod = device.createShaderModule({ code: litWGSL });
+  const litPipe = device.createRenderPipeline({
+    layout:'auto',
+    vertex:{ module: litMod, entryPoint:'vs',
+      buffers:[{ arrayStride:24, attributes:[
+        {shaderLocation:0, format:'float32x3', offset:0},
+        {shaderLocation:1, format:'float32x3', offset:12},
+      ]}]},
+    fragment:{ module: litMod, entryPoint:'fs', targets:[{format:chosen.fmt}]},
+    primitive:{ topology:'triangle-list', cullMode:'back' },
+    // no depth — draw order handles visibility
+  });
+
+  // Geometry helpers
+  function interleavePN(P,N,I){
+    const verts=new Float32Array((P.length/3)*6);
+    for(let i=0;i<P.length/3;i++){ verts.set(P.subarray(i*3,i*3+3), i*6); verts.set(N.subarray(i*3,i*3+3), i*6+3); }
+    const vb=device.createBuffer({size:verts.byteLength,usage:GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST});
+    device.queue.writeBuffer(vb,0,verts);
+    const ib=device.createBuffer({size:I.byteLength,usage:GPUBufferUsage.INDEX|GPUBufferUsage.COPY_DST});
+    device.queue.writeBuffer(ib,0,I);
+    return {vb,ib,count:I.length};
+  }
+  function plane(size=300){
+    const s=size/2;
+    const P=new Float32Array([-s,0,-s,  s,0,-s,  s,0,s,  -s,0,s]);
+    const N=new Float32Array([0,1,0, 0,1,0, 0,1,0, 0,1,0]);
+    const I=new Uint16Array([0,1,2, 0,2,3]);
+    return interleavePN(P,N,I);
+  }
+  function box(w=1,h=2,d=1){
+    const x=w/2,y=h/2,z=d/2,p=[],n=[],idx=[];
+    const faces=[[1,0,0, x,-y,-z, x,y,-z, x,y,z, x,-y,z],
+                 [-1,0,0,-x,-y,z,-x,y,z,-x,y,-z,-x,-y,-z],
+                 [0,1,0,-x,y,z, x,y,z, x,y,-z, -x,y,-z],
+                 [0,-1,0,-x,-y,-z, x,-y,-z, x,-y,z, -x,-y,z],
+                 [0,0,1,-x,-y,z, x,-y,z, x,y,z, -x,y,z],
+                 [0,0,-1, x,-y,-z,-x,-y,-z,-x,y,-z, x,y,-z]];
+    for(let f=0;f<6;f++){const base=p.length/3,[nx,ny,nz,...v]=faces[f];
+      for(let i=0;i<4;i++){p.push(v[i*3],v[i*3+1],v[i*3+2]); n.push(nx,ny,nz);}
+      idx.push(base,base+1,base+2, base,base+2,base+3);}
+    return interleavePN(new Float32Array(p),new Float32Array(n),new Uint16Array(idx));
+  }
+
+  // Meshes
+  const ground = plane(300);
+  const hero   = box(1,2,1);
+  const hutBase= box(3,1.4,3);
+  const hutRoof= box(3.2,0.8,3.2);
+  const post   = box(0.2,1.2,0.2);
+  const rock1  = box(1.2,0.7,0.9);
+  const rock2  = box(0.9,0.5,1.1);
+  const treeTrunk= box(0.4,1.6,0.4);
+  const treeTop  = box(1.6,1.0,1.6);
+
+  // Uniforms (vec4s only)
+  const SZ_G = (16+4)*4;        // viewProj + light(vec4)
+  const SZ_O = (16+4+2+2)*4;    // model + color(vec4) + uvScale(vec2)
+  const gBuf = device.createBuffer({ size: SZ_G, usage: GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST });
+  const bgG  = device.createBindGroup({ layout: litPipe.getBindGroupLayout(0), entries:[{binding:0,resource:{buffer:gBuf}}] });
+  function makeObjBG(){
+    const buf=device.createBuffer({ size: SZ_O, usage: GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST });
+    const bg =device.createBindGroup({ layout: litPipe.getBindGroupLayout(1), entries:[{binding:0,resource:{buffer:buf}}] });
+    return {buf,bg};
+  }
+
+  // Math
+  function I4(){return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);}
+  function mul(o,a,b){
+    const A=a,B=b;
+    o[0]=A[0]*B[0]+A[4]*B[1]+A[8]*B[2]+A[12]*B[3];
+    o[1]=A[1]*B[0]+A[5]*B[1]+A[9]*B[2]+A[13]*B[3];
+    o[2]=A[2]*B[0]+A[6]*B[1]+A[10]*B[2]+A[14]*B[3];
+    o[3]=A[3]*B[0]+A[7]*B[1]+A[11]*B[2]+A[15]*B[3];
+    o[4]=A[0]*B[4]+A[4]*B[5]+A[8]*B[6]+A[12]*B[7];
+    o[5]=A[1]*B[4]+A[5]*B[5]+A[9]*B[6]+A[13]*B[7];
+    o[6]=A[2]*B[4]+A[6]*B[5]+A[10]*B[6]+A[14]*B[7];
+    o[7]=A[3]*B[4]+A[7]*B[5]+A[11]*B[6]+A[15]*B[7];
+    o[8]=A[0]*B[8]+A[4]*B[9]+A[8]*B[10]+A[12]*B[11];
+    o[9]=A[1]*B[8]+A[5]*B[9]+A[9]*B[10]+A[13]*B[11];
+    o[10]=A[2]*B[8]+A[6]*B[9]+A[10]*B[10]+A[14]*B[11];
+    o[11]=A[3]*B[8]+A[7]*B[9]+A[11]*B[10]+A[15]*B[11];
+    o[12]=A[0]*B[12]+A[4]*B[13]+A[8]*B[14]+A[12]*B[15];
+    o[13]=A[1]*B[12]+A[5]*B[13]+A[9]*B[14]+A[13]*B[15];
+    o[14]=A[2]*B[12]+A[6]*B[13]+A[10]*B[14]+A[14]*B[15];
+    o[15]=A[3]*B[12]+A[7]*B[13]+A[11]*B[14]+A[15]*B[15];return o;
+  }
+  function persp(o,fovy,asp,n,f){ const q=1/Math.tan(fovy/2);
+    o[0]=q/asp;o[1]=0;o[2]=0;o[3]=0; o[4]=0;o[5]=q;o[6]=0;o[7]=0;
+    o[8]=0;o[9]=0;o[10]=f/(n-f);o[11]=-1; o[12]=0;o[13]=0;o[14]=(f*n)/(n-f);o[15]=0; return o;}
+  function lookAt(o,eye,ctr,up){
+    let zx=eye[0]-ctr[0],zy=eye[1]-ctr[1],zz=eye[2]-ctr[2];
+    const zl=Math.hypot(zx,zy,zz)||1; zx/=zl; zy/=zl; zz/=zl;
+    let rx=up[1]*zz-up[2]*zy, ry=up[2]*zx-up[0]*zz, rz=up[0]*zy-up[1]*zx;
+    const rl=Math.hypot(rx,ry,rz)||1; rx/=rl; ry/=rl; rz/=rl;
+    const ux=zy*rz-zz*ry, uy=zz*rx-zx*rz, uz=zx*ry-zy*rx;
+    o[0]=rx;o[1]=ux;o[2]=zx;o[3]=0; o[4]=ry;o[5]=uy;o[6]=zy;o[7]=0;
+    o[8]=rz;o[9]=uz;o[10]=zz;o[11]=0;
+    o[12]=-(rx*eye[0]+ry*eye[1]+rz*eye[2]);
+    o[13]=-(ux*eye[0]+uy*eye[1]+uz*eye[2]);
+    o[14]=-(zx*eye[0]+zy*eye[1]+zz*eye[2]); o[15]=1; return o;
+  }
+  function yRot(o,r){const c=Math.cos(r),s=Math.sin(r);
+    o[0]=c;o[1]=0;o[2]=s;o[3]=0; o[4]=0;o[5]=1;o[6]=0;o[7]=0; o[8]=-s;o[9]=0;o[10]=c;o[11]=0; o[12]=0;o[13]=0;o[14]=0;o[15]=1; return o;}
+  function trans(o,v){o.set([1,0,0,0, 0,1,0,0, 0,0,1,0, v[0],v[1],v[2],1]); return o;}
+  function scaleM(o,sx,sy,sz){o.set([sx,0,0,0, 0,sy,0,0, 0,0,sz,0, 0,0,0,1]); return o;}
+
+  // Scene & input (same as before)
+  let camYaw=0, camPitch=0.35, camDist=6;
+  const charPos=new Float32Array([0,1,0]);
+  const charVel=new Float32Array([0,0,0]);
+  let charYaw=0;
+  const gravity=-18, run=5, jump=7.5;
+
+  let leftId=null, rightId=null, joyCenter=[0,0], moveX=0, moveY=0, lastLook=[0,0], lastTap=0;
+  function toXY(e){const r=canvas.getBoundingClientRect();return [e.clientX-r.left,e.clientY-r.top];}
+  canvas.addEventListener('pointerdown',e=>{
+    e.preventDefault(); canvas.setPointerCapture?.(e.pointerId);
+    const [x]=toXY(e); const half=canvas.clientWidth/2; const now=performance.now();
+    if(now-lastTap<300) tryJump(); lastTap=now;
+    if(x<half && leftId===null){ leftId=e.pointerId; const p=toXY(e); joyCenter=p; updateJoy(p[0],p[1]); }
+    else if(rightId===null){ rightId=e.pointerId; lastLook=toXY(e); }
+    else if(leftId===null){ leftId=e.pointerId; const p=toXY(e); joyCenter=p; updateJoy(p[0],p[1]); }
+  },{passive:false});
+  canvas.addEventListener('pointermove',e=>{
+    if(e.pointerId!==leftId && e.pointerId!==rightId) return; const [x,y]=toXY(e);
+    if(e.pointerId===leftId) updateJoy(x,y);
+    else { const dx=x-lastLook[0], dy=y-lastLook[1]; lastLook=[x,y]; const s=0.006; camYaw-=dx*s; camPitch-=dy*s; camPitch=Math.max(-1.2,Math.min(1.2,camPitch)); }
+  });
+  canvas.addEventListener('pointerup',e=>{
+    if(e.pointerId===leftId){ leftId=null; moveX=moveY=0; }
+    if(e.pointerId===rightId){ rightId=null; }
+    canvas.releasePointerCapture?.(e.pointerId);
+  });
+  function updateJoy(x,y){ const max=Math.max(48,Math.min(96,canvas.clientWidth*0.08));
+    const dx=x-joyCenter[0], dy=y-joyCenter[1]; let m=Math.hypot(dx,dy); let ux=dx, uy=dy; if(m>max){ ux*=max/m; uy*=max/m; m=max; }
+    moveX=(ux/max); moveY=(-uy/max);
+  }
+  const keys=new Set();
+  addEventListener('keydown',e=>{
+    const k=e.key.toLowerCase(); if(['w','a','s','d','arrowup','arrowdown','arrowleft','arrowright',' '].includes(k)){ e.preventDefault(); keys.add(k); }
+  },{passive:false});
+  addEventListener('keyup',e=>keys.delete(e.key.toLowerCase()));
+  function keysToMove(){ let x=0,y=0;
+    if(keys.has('w')||keys.has('arrowup')) y+=1; if(keys.has('s')||keys.has('arrowdown')) y-=1;
+    if(keys.has('a')||keys.has('arrowleft')) x-=1; if(keys.has('d')||keys.has('arrowright')) x+=1;
+    const L=Math.hypot(x,y)||1; x/=L; y/=L; if(leftId===null){ moveX=x; moveY=y; } if(keys.has(' ')) tryJump();
+  }
+  function tryJump(){ const grounded=Math.abs(charPos[1]-1)<0.002 && Math.abs(charVel[1])<0.05; if(grounded) charVel[1]=jump; }
+
+  // Globals write
+  function writeGlobals(vp){ const d=new Float32Array(20); d.set(vp,0); d.set([0.45,0.85,0.35,0],16); device.queue.writeBuffer(gBuf,0,d); }
+
+  // Objects
+  const groundBG = makeObjBG();
+  { // ground: color.w=0 → procedural checker; uvScale controls tiling density
+    const d=new Float32Array(24);
+    d.set(I4(),0); d.set([0,0,0,0],16); d.set([0.5,0.5],20); // bigger = more tiles
+    device.queue.writeBuffer(groundBG.buf,0,d);
+  }
+
+  function makeSolid(mesh, model, colorRGB){
+    const o=makeObjBG(); const d=new Float32Array(24);
+    d.set(model,0); d.set([colorRGB[0],colorRGB[1],colorRGB[2],1],16); d.set([1,1],20);
+    device.queue.writeBuffer(o.buf,0,d); return {mesh,bg:o.bg};
+  }
+
+  // Place props (painter's order OK without depth)
+  const props=[];
+  function M_T(x,y,z){ const t=I4(); return trans(t,[x,y,z]), t; }
+  function M_TS(x,y,z, sx,sy,sz){ const Tm=I4(), Sm=I4(), M=I4(); trans(Tm,[x,y,z]); scaleM(Sm,sx,sy,sz); return mul(M,Tm,Sm), M; }
+
+  props.push(makeSolid(hutBase, M_T(6,0.7,-6), [0.55,0.40,0.30]));
+  props.push(makeSolid(hutRoof, M_T(6,2.1,-6), [0.45,0.15,0.10]));
+  for(let i=0;i<6;i++){ props.push(makeSolid(post, M_T(-8 + i*1.6,0.6,5), [0.55,0.45,0.35])); }
+  props.push(makeSolid(rock1, M_T(-4,0.35,-2), [0.50,0.50,0.55]));
+  props.push(makeSolid(rock2, M_T(-5,0.25,-3.5), [0.45,0.45,0.50]));
+  function addTree(x,z){
+    props.push(makeSolid(treeTrunk, M_T(x,0.8,z), [0.45,0.28,0.16]));
+    props.push(makeSolid(treeTop,   M_T(x,1.8,z), [0.10,0.55,0.22]));
+  }
+  addTree(10,4); addTree(12,-3); addTree(-10,-6); addTree(-12,5);
+
+  // hero object (updated each frame)
+  let heroBG = makeObjBG();
+
+  // Camera matrices
+  const proj=I4(), view=I4(), vp=I4(), R=I4(), T=I4(), M=I4();
+  function updateCamera(){
+    persp(proj, 50*Math.PI/180, aspect, 0.05, 500);
+    const cx=charPos[0], cy=charPos[1]+0.9, cz=charPos[2], r=6;
+    const ex=cx + r*Math.cos(camPitch)*Math.sin(camYaw);
+    const ey=cy + r*Math.sin(camPitch);
+    const ez=cz + r*Math.cos(camPitch)*Math.cos(camYaw);
+    lookAt(view,[ex,ey,ez],[cx,cy,cz],[0,1,0]); mul(vp,proj,view); writeGlobals(vp);
+  }
+
+  // Draw helpers
+  function drawMesh(pass, mesh){ pass.setVertexBuffer(0, mesh.vb); pass.setIndexBuffer(mesh.ib,'uint16'); pass.drawIndexed(mesh.count); }
+
+  // Loop
+  let last=performance.now(), frames=0, fps=0, fpsT=0;
+  function loop(){
+    const now=performance.now(); let dt=(now-last)/1000; if(dt>0.05) dt=0.05; last=now;
+    frames++; fpsT+=dt; if(fpsT>=0.5){ fps=Math.round(frames/fpsT); frames=0; fpsT=0; }
+    keysToMove();
+
+    // Movement
+    const fwd=[Math.sin(camYaw),0,Math.cos(camYaw)];
+    const rgt=[Math.cos(camYaw),0,-Math.sin(camYaw)];
+    let des=[ rgt[0]*moveX + fwd[0]*moveY, 0, rgt[2]*moveX + fwd[2]*moveY ];
+    const len=Math.hypot(des[0],des[2]); if(len>0){ des[0]/=len; des[2]/=len; }
+    const onGround = Math.abs(charPos[1]-1)<0.002 || charPos[1]<1+1e-3;
+    const sp = onGround ? run : run*0.6;
+    charVel[0]=des[0]*sp; charVel[2]=des[2]*sp; charVel[1]+=gravity*dt;
+    charPos[0]+=charVel[0]*dt; charPos[1]+=charVel[1]*dt; charPos[2]+=charVel[2]*dt;
+    if(charPos[1]<1){ charPos[1]=1; charVel[1]=0; }
+    if(len>0.001){ const target=Math.atan2(charVel[0],charVel[2]); const diff=((target-charYaw+Math.PI*3)%(Math.PI*2))-Math.PI; charYaw+=diff*Math.min(12*dt,1); }
+
+    // Camera + hero model
+    updateCamera();
+    yRot(R,charYaw); trans(T,charPos); mul(M,T,R);
+    { const d=new Float32Array(24); d.set(M,0); d.set([0.85,0.70,0.25,1],16); d.set([1,1],20); device.queue.writeBuffer(heroBG.buf,0,d); }
+
+    // Encode (single pass)
+    const viewT = context.getCurrentTexture().createView();
+    const enc = device.createCommandEncoder();
+    const pass = enc.beginRenderPass({
+      colorAttachments:[{ view: viewT, loadOp:'clear', clearValue:{r:.58,g:.72,b:.92,a:1}, storeOp:'store' }]
+    });
+
+    // Sky first (simple; we’re already clearing sky color, but drawing it keeps the structure if we upgrade later)
+    pass.setPipeline(skyPipe);
+    pass.draw(3);
+
+    // Lit geo (painter order: ground -> props -> hero)
+    pass.setPipeline(litPipe);
+    pass.setBindGroup(0,bgG);
+
+    // ground (procedural checker: color.w=0)
+    pass.setBindGroup(1, groundBG.bg);
+    drawMesh(pass, ground);
+
+    // props
+    for(const p of props){ pass.setBindGroup(1, p.bg); drawMesh(pass, p.mesh); }
+
+    // hero
+    pass.setBindGroup(1, heroBG.bg);
+    drawMesh(pass, hero);
+
+    pass.end(); device.queue.submit([enc.finish()]);
+
+    log(`swap: ${chosen.fmt} • ${canvas.width}×${canvas.height} • FPS ${fps}`);
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>

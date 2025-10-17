@@ -1,0 +1,14 @@
+{
+  "name": "web-gpu-world",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "WebGPU 3D world with third-person character controls",
+  "scripts": {
+    "dev": "python -m http.server 8000",
+    "build": "node build-tools/bundle.js",
+    "serve:dist": "python -m http.server 8001 --directory dist"
+  },
+  "keywords": ["webgpu", "3d", "game"],
+  "author": "",
+  "license": "MIT"
+}
