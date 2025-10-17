@@ -1,0 +1,1581 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>WebGPU 3rd-Person (Safe Sky + Procedural Ground + Props)</title>
+<style>
+  html,body{margin:0;height:100svh;width:100vw;overflow:hidden;background:#000;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+  canvas{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none}
+  #hud{position:fixed;left:8px;top:calc(8px + env(safe-area-inset-top));right:8px;pointer-events:none}
+  #status{font:12px/1.35 system-ui;white-space:pre-wrap;background:rgba(0,0,0,.55);color:#e6eefb;border-radius:10px;padding:10px}
+</style>
+<canvas id="gfx"></canvas>
+<div id="hud">
+  <div id="status">boot…</div>
+</div>
+<script>
+(async()=>{
+// WebGPU initialization and canvas configuration
+
+async function initWebGPU(canvas) {
+  if (!('gpu' in navigator)) {
+    throw new Error('No WebGPU');
+  }
+
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) {
+    throw new Error('No adapter');
+  }
+
+  const device = await adapter.requestDevice();
+  const context = canvas.getContext('webgpu');
+
+  // Progressive format fallback
+  const combos = [
+    { fmt: navigator.gpu.getPreferredCanvasFormat(), alpha: 'opaque' },
+    { fmt: 'bgra8unorm', alpha: 'opaque' },
+    { fmt: 'rgba8unorm', alpha: 'opaque' },
+    { fmt: navigator.gpu.getPreferredCanvasFormat(), alpha: 'premultiplied' },
+    { fmt: 'bgra8unorm', alpha: 'premultiplied' },
+    { fmt: 'rgba8unorm', alpha: 'premultiplied' },
+  ];
+
+  let chosen = combos[0];
+  let aspect = 1;
+
+  function configure() {
+    context.configure({ device, format: chosen.fmt, alphaMode: chosen.alpha });
+  }
+
+  function resize() {
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    canvas.width = Math.max(1, (canvas.clientWidth * dpr) | 0);
+    canvas.height = Math.max(1, (canvas.clientHeight * dpr) | 0);
+    aspect = canvas.width / canvas.height;
+
+    try {
+      configure();
+    } catch (e) {
+      for (const c of combos) {
+        try {
+          context.configure({ device, format: c.fmt, alphaMode: c.alpha });
+          chosen = c;
+          break;
+        } catch (_) {}
+      }
+    }
+  }
+
+  new ResizeObserver(resize).observe(canvas);
+  resize();
+
+  return { device, context, getAspect: () => aspect, getFormat: () => chosen };
+}
+
+async function loadShader(url) {
+  const response = await fetch(url);
+  return await response.text();
+}
+
+// Pipeline creation for sky and lit geometry rendering
+
+function createSkyPipeline(device, format, shaderCode) {
+  const module = device.createShaderModule({ code: shaderCode });
+
+  return device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module, entryPoint: 'vs' },
+    fragment: { module, entryPoint: 'fs', targets: [{ format }] },
+    primitive: { topology: 'triangle-list' }
+  });
+}
+
+function createLitPipeline(device, format, shaderCode) {
+  const module = device.createShaderModule({ code: shaderCode });
+
+  return device.createRenderPipeline({
+    layout: 'auto',
+    vertex: {
+      module,
+      entryPoint: 'vs',
+      buffers: [{
+        arrayStride: 24,
+        attributes: [
+          { shaderLocation: 0, format: 'float32x3', offset: 0 },
+          { shaderLocation: 1, format: 'float32x3', offset: 12 },
+        ]
+      }]
+    },
+    fragment: { module, entryPoint: 'fs', targets: [{ format }] },
+    primitive: { topology: 'triangle-list', cullMode: 'back' },
+  });
+}
+
+// Uniform buffer management for globals and per-object data
+
+const SZ_G = (16 + 4) * 4; // viewProj + light(vec4)
+const SZ_O = (16 + 4 + 2 + 2) * 4; // model + color(vec4) + uvScale(vec2) + pad
+
+function createGlobalsBuffer(device, pipeline) {
+  const buffer = device.createBuffer({
+    size: SZ_G,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+  });
+
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer } }]
+  });
+
+  return { buffer, bindGroup };
+}
+
+function writeGlobals(device, buffer, viewProj) {
+  const data = new Float32Array(20);
+  data.set(viewProj, 0);
+  data.set([0.45, 0.85, 0.35, 0], 16); // light direction
+  device.queue.writeBuffer(buffer, 0, data);
+}
+
+function createObjectBuffer(device, pipeline) {
+  const buffer = device.createBuffer({
+    size: SZ_O,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+  });
+
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(1),
+    entries: [{ binding: 0, resource: { buffer } }]
+  });
+
+  return { buffer, bindGroup };
+}
+
+function writeObjectUniforms(device, buffer, model, color, uvScale = [1, 1]) {
+  const data = new Float32Array(24);
+  data.set(model, 0);
+  data.set(color, 16);
+  data.set(uvScale, 20);
+  device.queue.writeBuffer(buffer, 0, data);
+}
+
+// Geometry primitives - creates interleaved vertex buffers with Position + Normal
+
+function interleavePN(device, P, N, I) {
+  const verts = new Float32Array((P.length / 3) * 6);
+  for (let i = 0; i < P.length / 3; i++) {
+    verts.set(P.subarray(i * 3, i * 3 + 3), i * 6);
+    verts.set(N.subarray(i * 3, i * 3 + 3), i * 6 + 3);
+  }
+
+  const vb = device.createBuffer({
+    size: verts.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+  });
+  device.queue.writeBuffer(vb, 0, verts);
+
+  const ib = device.createBuffer({
+    size: I.byteLength,
+    usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST
+  });
+  device.queue.writeBuffer(ib, 0, I);
+
+  return { vb, ib, count: I.length };
+}
+
+function createPlane(device, size = 300) {
+  const s = size / 2;
+  const P = new Float32Array([-s,0,-s, s,0,-s, s,0,s, -s,0,s]);
+  const N = new Float32Array([0,1,0, 0,1,0, 0,1,0, 0,1,0]);
+  const I = new Uint16Array([0,1,2, 0,2,3]);
+  return interleavePN(device, P, N, I);
+}
+
+function createBox(device, w = 1, h = 2, d = 1) {
+  const x = w/2, y = h/2, z = d/2;
+  const p = [], n = [], idx = [];
+
+  const faces = [
+    [1,0,0,  x,-y,-z, x,y,-z, x,y,z, x,-y,z],
+    [-1,0,0, -x,-y,z, -x,y,z, -x,y,-z, -x,-y,-z],
+    [0,1,0,  -x,y,z, x,y,z, x,y,-z, -x,y,-z],
+    [0,-1,0, -x,-y,-z, x,-y,-z, x,-y,z, -x,-y,z],
+    [0,0,1,  -x,-y,z, x,-y,z, x,y,z, -x,y,z],
+    [0,0,-1, x,-y,-z, -x,-y,-z, -x,y,-z, x,y,-z]
+  ];
+
+  for (let f = 0; f < 6; f++) {
+    const base = p.length / 3;
+    const [nx, ny, nz, ...v] = faces[f];
+
+    for (let i = 0; i < 4; i++) {
+      p.push(v[i*3], v[i*3+1], v[i*3+2]);
+      n.push(nx, ny, nz);
+    }
+
+    idx.push(base, base+1, base+2, base, base+2, base+3);
+  }
+
+  return interleavePN(device, new Float32Array(p), new Float32Array(n), new Uint16Array(idx));
+}
+
+// Input handling - dual system for desktop (keyboard/mouse) and mobile (touch)
+
+class InputController {
+  constructor(canvas) {
+    this.canvas = canvas;
+
+    // Touch/pointer state
+    this.leftId = null;
+    this.rightId = null;
+    this.joyCenter = [0, 0];
+    this.moveX = 0;
+    this.moveY = 0;
+    this.lastLook = [0, 0];
+    this.lastTap = 0;
+
+    // Keyboard state
+    this.keys = new Set();
+
+    // Camera control
+    this.camYaw = 0;
+    this.camPitch = 0.35;
+
+    // Jump callback
+    this.onJump = null;
+
+    this._setupEventListeners();
+  }
+
+  _toXY(e) {
+    const r = this.canvas.getBoundingClientRect();
+    return [e.clientX - r.left, e.clientY - r.top];
+  }
+
+  _updateJoy(x, y) {
+    const max = Math.max(48, Math.min(96, this.canvas.clientWidth * 0.08));
+    const dx = x - this.joyCenter[0];
+    const dy = y - this.joyCenter[1];
+    let m = Math.hypot(dx, dy);
+    let ux = dx, uy = dy;
+
+    if (m > max) {
+      ux *= max / m;
+      uy *= max / m;
+      m = max;
+    }
+
+    this.moveX = ux / max;
+    this.moveY = -uy / max;
+  }
+
+  _tryJump() {
+    if (this.onJump) {
+      this.onJump();
+    }
+  }
+
+  _setupEventListeners() {
+    // Touch/pointer events
+    this.canvas.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      this.canvas.setPointerCapture?.(e.pointerId);
+
+      const [x] = this._toXY(e);
+      const half = this.canvas.clientWidth / 2;
+      const now = performance.now();
+
+      // Double-tap to jump
+      if (now - this.lastTap < 300) this._tryJump();
+      this.lastTap = now;
+
+      if (x < half && this.leftId === null) {
+        this.leftId = e.pointerId;
+        const p = this._toXY(e);
+        this.joyCenter = p;
+        this._updateJoy(p[0], p[1]);
+      } else if (this.rightId === null) {
+        this.rightId = e.pointerId;
+        this.lastLook = this._toXY(e);
+      } else if (this.leftId === null) {
+        this.leftId = e.pointerId;
+        const p = this._toXY(e);
+        this.joyCenter = p;
+        this._updateJoy(p[0], p[1]);
+      }
+    }, { passive: false });
+
+    this.canvas.addEventListener('pointermove', (e) => {
+      if (e.pointerId !== this.leftId && e.pointerId !== this.rightId) return;
+
+      const [x, y] = this._toXY(e);
+
+      if (e.pointerId === this.leftId) {
+        this._updateJoy(x, y);
+      } else {
+        const dx = x - this.lastLook[0];
+        const dy = y - this.lastLook[1];
+        this.lastLook = [x, y];
+
+        const s = 0.006;
+        this.camYaw -= dx * s;
+        this.camPitch -= dy * s;
+        this.camPitch = Math.max(-1.2, Math.min(1.2, this.camPitch));
+      }
+    });
+
+    this.canvas.addEventListener('pointerup', (e) => {
+      if (e.pointerId === this.leftId) {
+        this.leftId = null;
+        this.moveX = this.moveY = 0;
+      }
+      if (e.pointerId === this.rightId) {
+        this.rightId = null;
+      }
+      this.canvas.releasePointerCapture?.(e.pointerId);
+    });
+
+    // Keyboard events
+    addEventListener('keydown', (e) => {
+      const k = e.key.toLowerCase();
+      if (['w','a','s','d','arrowup','arrowdown','arrowleft','arrowright',' '].includes(k)) {
+        e.preventDefault();
+        this.keys.add(k);
+      }
+    }, { passive: false });
+
+    addEventListener('keyup', (e) => {
+      this.keys.delete(e.key.toLowerCase());
+    });
+  }
+
+  updateFromKeyboard() {
+    let x = 0, y = 0;
+
+    if (this.keys.has('w') || this.keys.has('arrowup')) y += 1;
+    if (this.keys.has('s') || this.keys.has('arrowdown')) y -= 1;
+    if (this.keys.has('a') || this.keys.has('arrowleft')) x -= 1;
+    if (this.keys.has('d') || this.keys.has('arrowright')) x += 1;
+
+    const L = Math.hypot(x, y) || 1;
+    x /= L;
+    y /= L;
+
+    if (this.leftId === null) {
+      this.moveX = x;
+      this.moveY = y;
+    }
+
+    if (this.keys.has(' ')) {
+      this._tryJump();
+    }
+  }
+
+  getMovement() {
+    return { x: this.moveX, y: this.moveY };
+  }
+
+  getCamera() {
+    return { yaw: this.camYaw, pitch: this.camPitch };
+  }
+}
+
+// Character physics - arcade-style movement with gravity
+
+class CharacterPhysics {
+  constructor() {
+    this.position = new Float32Array([0, 1, 0]);
+    this.velocity = new Float32Array([0, 0, 0]);
+    this.yaw = 0;
+
+    // Physics constants
+    this.gravity = -18;
+    this.runSpeed = 5;
+    this.jumpVelocity = 7.5;
+    this.groundY = 1;
+  }
+
+  update(dt, moveDir, camYaw) {
+    // Calculate movement direction in world space
+    const fwd = [Math.sin(camYaw), 0, Math.cos(camYaw)];
+    const rgt = [Math.cos(camYaw), 0, -Math.sin(camYaw)];
+
+    let desired = [
+      rgt[0] * moveDir.x + fwd[0] * moveDir.y,
+      0,
+      rgt[2] * moveDir.x + fwd[2] * moveDir.y
+    ];
+
+    const len = Math.hypot(desired[0], desired[2]);
+    if (len > 0) {
+      desired[0] /= len;
+      desired[2] /= len;
+    }
+
+    // Apply movement speed
+    const onGround = Math.abs(this.position[1] - this.groundY) < 0.002 || this.position[1] < this.groundY + 1e-3;
+    const speed = onGround ? this.runSpeed : this.runSpeed * 0.6;
+
+    this.velocity[0] = desired[0] * speed;
+    this.velocity[2] = desired[2] * speed;
+
+    // Apply gravity
+    this.velocity[1] += this.gravity * dt;
+
+    // Update position
+    this.position[0] += this.velocity[0] * dt;
+    this.position[1] += this.velocity[1] * dt;
+    this.position[2] += this.velocity[2] * dt;
+
+    // Ground collision
+    if (this.position[1] < this.groundY) {
+      this.position[1] = this.groundY;
+      this.velocity[1] = 0;
+    }
+
+    // Rotate character to face movement direction
+    if (len > 0.001) {
+      const target = Math.atan2(this.velocity[0], this.velocity[2]);
+      const diff = ((target - this.yaw + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+      this.yaw += diff * Math.min(12 * dt, 1);
+    }
+  }
+
+  tryJump() {
+    const grounded = Math.abs(this.position[1] - this.groundY) < 0.002 && Math.abs(this.velocity[1]) < 0.05;
+    if (grounded) {
+      this.velocity[1] = this.jumpVelocity;
+    }
+  }
+
+  getPosition() {
+    return this.position;
+  }
+
+  getYaw() {
+    return this.yaw;
+  }
+}
+
+// Matrix math utilities - all operations use Float32Array for GPU compatibility
+
+function identity() {
+  return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+}
+
+function multiply(out, a, b) {
+  const A = a, B = b;
+  out[0] = A[0]*B[0] + A[4]*B[1] + A[8]*B[2] + A[12]*B[3];
+  out[1] = A[1]*B[0] + A[5]*B[1] + A[9]*B[2] + A[13]*B[3];
+  out[2] = A[2]*B[0] + A[6]*B[1] + A[10]*B[2] + A[14]*B[3];
+  out[3] = A[3]*B[0] + A[7]*B[1] + A[11]*B[2] + A[15]*B[3];
+  out[4] = A[0]*B[4] + A[4]*B[5] + A[8]*B[6] + A[12]*B[7];
+  out[5] = A[1]*B[4] + A[5]*B[5] + A[9]*B[6] + A[13]*B[7];
+  out[6] = A[2]*B[4] + A[6]*B[5] + A[10]*B[6] + A[14]*B[7];
+  out[7] = A[3]*B[4] + A[7]*B[5] + A[11]*B[6] + A[15]*B[7];
+  out[8] = A[0]*B[8] + A[4]*B[9] + A[8]*B[10] + A[12]*B[11];
+  out[9] = A[1]*B[8] + A[5]*B[9] + A[9]*B[10] + A[13]*B[11];
+  out[10] = A[2]*B[8] + A[6]*B[9] + A[10]*B[10] + A[14]*B[11];
+  out[11] = A[3]*B[8] + A[7]*B[9] + A[11]*B[10] + A[15]*B[11];
+  out[12] = A[0]*B[12] + A[4]*B[13] + A[8]*B[14] + A[12]*B[15];
+  out[13] = A[1]*B[12] + A[5]*B[13] + A[9]*B[14] + A[13]*B[15];
+  out[14] = A[2]*B[12] + A[6]*B[13] + A[10]*B[14] + A[14]*B[15];
+  out[15] = A[3]*B[12] + A[7]*B[13] + A[11]*B[14] + A[15]*B[15];
+  return out;
+}
+
+function perspective(out, fovy, aspect, near, far) {
+  const q = 1 / Math.tan(fovy / 2);
+  out[0] = q/aspect; out[1] = 0; out[2] = 0; out[3] = 0;
+  out[4] = 0; out[5] = q; out[6] = 0; out[7] = 0;
+  out[8] = 0; out[9] = 0; out[10] = far/(near-far); out[11] = -1;
+  out[12] = 0; out[13] = 0; out[14] = (far*near)/(near-far); out[15] = 0;
+  return out;
+}
+
+function lookAt(out, eye, center, up) {
+  let zx = eye[0] - center[0], zy = eye[1] - center[1], zz = eye[2] - center[2];
+  const zl = Math.hypot(zx, zy, zz) || 1;
+  zx /= zl; zy /= zl; zz /= zl;
+
+  let rx = up[1]*zz - up[2]*zy;
+  let ry = up[2]*zx - up[0]*zz;
+  let rz = up[0]*zy - up[1]*zx;
+  const rl = Math.hypot(rx, ry, rz) || 1;
+  rx /= rl; ry /= rl; rz /= rl;
+
+  const ux = zy*rz - zz*ry;
+  const uy = zz*rx - zx*rz;
+  const uz = zx*ry - zy*rx;
+
+  out[0] = rx; out[1] = ux; out[2] = zx; out[3] = 0;
+  out[4] = ry; out[5] = uy; out[6] = zy; out[7] = 0;
+  out[8] = rz; out[9] = uz; out[10] = zz; out[11] = 0;
+  out[12] = -(rx*eye[0] + ry*eye[1] + rz*eye[2]);
+  out[13] = -(ux*eye[0] + uy*eye[1] + uz*eye[2]);
+  out[14] = -(zx*eye[0] + zy*eye[1] + zz*eye[2]);
+  out[15] = 1;
+  return out;
+}
+
+function rotateY(out, radians) {
+  const c = Math.cos(radians), s = Math.sin(radians);
+  out[0] = c; out[1] = 0; out[2] = s; out[3] = 0;
+  out[4] = 0; out[5] = 1; out[6] = 0; out[7] = 0;
+  out[8] = -s; out[9] = 0; out[10] = c; out[11] = 0;
+  out[12] = 0; out[13] = 0; out[14] = 0; out[15] = 1;
+  return out;
+}
+
+function translate(out, vec) {
+  out.set([1,0,0,0, 0,1,0,0, 0,0,1,0, vec[0], vec[1], vec[2], 1]);
+  return out;
+}
+
+function scale(out, sx, sy, sz) {
+  out.set([sx,0,0,0, 0,sy,0,0, 0,0,sz,0, 0,0,0,1]);
+  return out;
+}
+
+// Camera system - third-person orbiting camera
+
+class Camera {
+  constructor() {
+    this.distance = 6;
+    this.heightOffset = 0.9;
+
+    this.proj = identity();
+    this.view = identity();
+    this.viewProj = identity();
+  }
+
+  update(aspect, charPos, yaw, pitch) {
+    // Projection matrix
+    perspective(this.proj, 50 * Math.PI / 180, aspect, 0.05, 500);
+
+    // Camera position orbiting character
+    const cx = charPos[0];
+    const cy = charPos[1] + this.heightOffset;
+    const cz = charPos[2];
+
+    const ex = cx + this.distance * Math.cos(pitch) * Math.sin(yaw);
+    const ey = cy + this.distance * Math.sin(pitch);
+    const ez = cz + this.distance * Math.cos(pitch) * Math.cos(yaw);
+
+    // View matrix
+    lookAt(this.view, [ex, ey, ez], [cx, cy, cz], [0, 1, 0]);
+
+    // Combined view-projection
+    multiply(this.viewProj, this.proj, this.view);
+  }
+
+  getViewProj() {
+    return this.viewProj;
+  }
+}
+
+// Scene prop creation and management
+
+function makeTransform(x, y, z) {
+  const t = identity();
+  return translate(t, [x, y, z]);
+}
+
+function makeTransformScale(x, y, z, sx, sy, sz) {
+  const T = identity();
+  const S = identity();
+  const M = identity();
+  translate(T, [x, y, z]);
+  scale(S, sx, sy, sz);
+  return multiply(M, T, S);
+}
+
+function createSolidProp(device, pipeline, mesh, model, colorRGB) {
+  const { buffer, bindGroup } = createObjectBuffer(device, pipeline);
+  const color = [colorRGB[0], colorRGB[1], colorRGB[2], 1];
+  writeObjectUniforms(device, buffer, model, color, [1, 1]);
+
+  return { mesh, buffer, bindGroup };
+}
+
+function createGroundObject(device, pipeline, mesh) {
+  const { buffer, bindGroup } = createObjectBuffer(device, pipeline);
+  const model = identity();
+  const color = [0, 0, 0, 0]; // w=0 triggers procedural checker
+  const uvScale = [0.5, 0.5]; // tile density
+  writeObjectUniforms(device, buffer, model, color, uvScale);
+
+  return { mesh, buffer, bindGroup };
+}
+
+function buildSceneProps(device, pipeline, meshes) {
+  const props = [];
+
+  // Hut
+  props.push(createSolidProp(device, pipeline, meshes.hutBase, makeTransform(6, 0.7, -6), [0.55, 0.40, 0.30]));
+  props.push(createSolidProp(device, pipeline, meshes.hutRoof, makeTransform(6, 2.1, -6), [0.45, 0.15, 0.10]));
+
+  // Fence posts
+  for (let i = 0; i < 6; i++) {
+    props.push(createSolidProp(device, pipeline, meshes.post, makeTransform(-8 + i * 1.6, 0.6, 5), [0.55, 0.45, 0.35]));
+  }
+
+  // Rocks
+  props.push(createSolidProp(device, pipeline, meshes.rock1, makeTransform(-4, 0.35, -2), [0.50, 0.50, 0.55]));
+  props.push(createSolidProp(device, pipeline, meshes.rock2, makeTransform(-5, 0.25, -3.5), [0.45, 0.45, 0.50]));
+
+  // Trees
+  const addTree = (x, z) => {
+    props.push(createSolidProp(device, pipeline, meshes.treeTrunk, makeTransform(x, 0.8, z), [0.45, 0.28, 0.16]));
+    props.push(createSolidProp(device, pipeline, meshes.treeTop, makeTransform(x, 1.8, z), [0.10, 0.55, 0.22]));
+  };
+
+  addTree(10, 4);
+  addTree(12, -3);
+  addTree(-10, -6);
+  addTree(-12, 5);
+
+  return props;
+}
+
+// WebGPU Setup Guide - Interactive guides for enabling WebGPU
+
+class WebGPUSetupGuide {
+  constructor() {
+    this.overlay = null;
+    this.currentStep = 0;
+    this.currentPlatform = null;
+  }
+
+  detectPlatform() {
+    const ua = navigator.userAgent.toLowerCase();
+    const isIOS = /iphone|ipad|ipod/.test(ua);
+    const isMacOS = /macintosh|mac os x/.test(ua) && !isIOS;
+    const isChrome = /chrome|chromium|crios/.test(ua) && !/edg/.test(ua);
+    const isEdge = /edg/.test(ua);
+    const isSafari = /safari/.test(ua) && !/chrome|chromium|crios/.test(ua);
+
+    if (isIOS && isSafari) return 'ios-safari';
+    if (isMacOS && isSafari) return 'macos-safari';
+    if (isChrome) return 'chrome';
+    if (isEdge) return 'edge';
+    return 'chrome'; // Default fallback
+  }
+
+  show() {
+    if (this.overlay) return;
+
+    this.overlay = document.createElement('div');
+    this.overlay.className = 'webgpu-setup-guide-overlay';
+    this.overlay.innerHTML = `
+      <div class="setup-guide-modal">
+        <div class="setup-guide-header">
+          <h2>WebGPU Required</h2>
+          <p>This experience uses WebGPU, a modern graphics technology that needs to be enabled in your browser.</p>
+        </div>
+
+        <div class="setup-guide-content" id="setup-guide-content">
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(this.overlay);
+    this._showPlatformSelector();
+  }
+
+  _showPlatformSelector() {
+    const detected = this.detectPlatform();
+    const content = this.overlay.querySelector('#setup-guide-content');
+
+    content.innerHTML = `
+      <div class="platform-selector">
+        <p class="selector-label">Select your browser to see setup instructions:</p>
+        <div class="platform-buttons">
+          <button class="platform-btn ${detected === 'chrome' ? 'detected' : ''}" data-platform="chrome">
+            <span class="platform-icon">🌐</span>
+            <span class="platform-name">Chrome</span>
+            ${detected === 'chrome' ? '<span class="detected-badge">Detected</span>' : ''}
+          </button>
+          <button class="platform-btn ${detected === 'edge' ? 'detected' : ''}" data-platform="edge">
+            <span class="platform-icon">🌊</span>
+            <span class="platform-name">Edge</span>
+            ${detected === 'edge' ? '<span class="detected-badge">Detected</span>' : ''}
+          </button>
+          <button class="platform-btn ${detected === 'ios-safari' ? 'detected' : ''}" data-platform="ios-safari">
+            <span class="platform-icon">📱</span>
+            <span class="platform-name">iOS Safari</span>
+            ${detected === 'ios-safari' ? '<span class="detected-badge">Detected</span>' : ''}
+          </button>
+          <button class="platform-btn ${detected === 'macos-safari' ? 'detected' : ''}" data-platform="macos-safari">
+            <span class="platform-icon">🍎</span>
+            <span class="platform-name">macOS Safari</span>
+            ${detected === 'macos-safari' ? '<span class="detected-badge">Detected</span>' : ''}
+          </button>
+        </div>
+      </div>
+    `;
+
+    this._attachPlatformListeners();
+  }
+
+  _attachPlatformListeners() {
+    const buttons = this.overlay.querySelectorAll('.platform-btn');
+    buttons.forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const platform = e.currentTarget.dataset.platform;
+        this._showPlatformGuide(platform);
+      });
+    });
+  }
+
+  _showPlatformGuide(platform) {
+    this.currentPlatform = platform;
+    this.currentStep = 0;
+
+    const content = this.overlay.querySelector('#setup-guide-content');
+    const guide = this._getPlatformGuide(platform);
+
+    content.innerHTML = `
+      <div class="guide-container">
+        <button class="back-btn" id="back-to-platforms">← Back to platforms</button>
+
+        <div class="guide-header">
+          <h3>${guide.title}</h3>
+          <p class="guide-subtitle">${guide.subtitle}</p>
+        </div>
+
+        <div class="steps-container">
+          ${guide.steps.map((step, idx) => `
+            <div class="step ${idx === 0 ? 'active' : ''}" data-step="${idx}">
+              <div class="step-number">${idx + 1}</div>
+              <div class="step-content">
+                <h4>${step.title}</h4>
+                <p>${step.description}</p>
+                ${step.visual ? `<div class="step-visual">${step.visual}</div>` : ''}
+                ${step.note ? `<p class="step-note">${step.note}</p>` : ''}
+              </div>
+            </div>
+          `).join('')}
+        </div>
+
+        <div class="guide-footer">
+          <button class="btn-secondary" id="prev-step" disabled>Previous</button>
+          <div class="step-indicator">
+            <span class="current-step">1</span> / <span class="total-steps">${guide.steps.length}</span>
+          </div>
+          <button class="btn-primary" id="next-step">Next</button>
+        </div>
+      </div>
+    `;
+
+    this._attachGuideListeners(guide);
+  }
+
+  _attachGuideListeners(guide) {
+    const backBtn = this.overlay.querySelector('#back-to-platforms');
+    const prevBtn = this.overlay.querySelector('#prev-step');
+    const nextBtn = this.overlay.querySelector('#next-step');
+    const steps = this.overlay.querySelectorAll('.step');
+
+    backBtn.addEventListener('click', () => this._showPlatformSelector());
+
+    prevBtn.addEventListener('click', () => {
+      if (this.currentStep > 0) {
+        this.currentStep--;
+        this._updateStepDisplay(steps, prevBtn, nextBtn, guide.steps.length);
+      }
+    });
+
+    nextBtn.addEventListener('click', () => {
+      if (this.currentStep < guide.steps.length - 1) {
+        this.currentStep++;
+        this._updateStepDisplay(steps, prevBtn, nextBtn, guide.steps.length);
+      } else {
+        // Last step - reload page
+        window.location.reload();
+      }
+    });
+  }
+
+  _updateStepDisplay(steps, prevBtn, nextBtn, totalSteps) {
+    steps.forEach((step, idx) => {
+      step.classList.toggle('active', idx === this.currentStep);
+      step.classList.toggle('completed', idx < this.currentStep);
+    });
+
+    prevBtn.disabled = this.currentStep === 0;
+    nextBtn.textContent = this.currentStep === totalSteps - 1 ? 'Done - Reload Page' : 'Next';
+
+    const currentStepEl = this.overlay.querySelector('.current-step');
+    currentStepEl.textContent = this.currentStep + 1;
+
+    // Scroll to active step
+    const activeStep = this.overlay.querySelector('.step.active');
+    if (activeStep) {
+      activeStep.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  }
+
+  _getPlatformGuide(platform) {
+    const guides = {
+      'chrome': {
+        title: 'Enable WebGPU in Chrome',
+        subtitle: 'Follow these steps to enable WebGPU',
+        steps: [
+          {
+            title: 'Open Chrome Flags',
+            description: 'Type or paste this URL into your address bar and press Enter:',
+            visual: '<code class="url-code">chrome://flags</code>'
+          },
+          {
+            title: 'Search for "Unsafe WebGPU"',
+            description: 'In the search box at the top, type: <strong>unsafe webgpu</strong>',
+            visual: '<div class="search-example">🔍 unsafe webgpu</div>'
+          },
+          {
+            title: 'Enable the flag',
+            description: 'Find "Unsafe WebGPU Support" and change the dropdown from "Default" to "Enabled".',
+            visual: '<div class="flag-visual"><div class="flag-name">Unsafe WebGPU Support</div><div class="flag-dropdown">Default → <strong>Enabled</strong></div></div>',
+            note: 'The "unsafe" label is temporary while WebGPU is being finalized.'
+          },
+          {
+            title: 'Relaunch Chrome',
+            description: 'Click the "Relaunch" button that appears at the bottom of the page, or close and reopen Chrome manually.',
+            visual: '<div class="relaunch-btn-visual">🔄 Relaunch</div>'
+          }
+        ]
+      },
+      'edge': {
+        title: 'Enable WebGPU in Edge',
+        subtitle: 'Follow these steps to enable WebGPU',
+        steps: [
+          {
+            title: 'Open Edge Flags',
+            description: 'Type or paste this URL into your address bar:',
+            visual: '<code class="url-code">edge://flags</code>'
+          },
+          {
+            title: 'Search for "Unsafe WebGPU"',
+            description: 'Use the search box to find: <strong>unsafe webgpu</strong>',
+            visual: '<div class="search-example">🔍 unsafe webgpu</div>'
+          },
+          {
+            title: 'Enable the feature',
+            description: 'Locate "Unsafe WebGPU Support" and set it to "Enabled".',
+            visual: '<div class="flag-visual"><div class="flag-name">Unsafe WebGPU Support</div><div class="flag-dropdown">Default → <strong>Enabled</strong></div></div>'
+          },
+          {
+            title: 'Restart Edge',
+            description: 'Click "Restart" when prompted, or close and reopen Edge.',
+            visual: '<div class="relaunch-btn-visual">🔄 Restart</div>'
+          }
+        ]
+      },
+      'ios-safari': {
+        title: 'Enable WebGPU in iOS Safari',
+        subtitle: 'Follow these steps to enable WebGPU',
+        steps: [
+          {
+            title: 'Open Safari Settings',
+            description: 'On your home screen, open the Settings app and scroll down to find Safari.',
+            visual: '<div class="ios-icon">⚙️ Settings → 🧭 Safari</div>'
+          },
+          {
+            title: 'Go to Advanced settings',
+            description: 'Scroll to the bottom of Safari settings and tap "Advanced".',
+            visual: '<div class="ios-menu-item">Advanced ›</div>'
+          },
+          {
+            title: 'Enable Feature Flags',
+            description: 'In Advanced settings, tap "Feature Flags" (you may need to scroll).',
+            visual: '<div class="ios-menu-item">Feature Flags ›</div>'
+          },
+          {
+            title: 'Find and enable WebGPU',
+            description: 'Scroll through the feature flags list and find "WebGPU". Toggle it ON (green).',
+            visual: '<div class="ios-toggle">WebGPU <span class="toggle-on">ON</span></div>',
+            note: 'The toggle should be green when enabled.'
+          },
+          {
+            title: 'Close Safari completely',
+            description: 'Swipe up from the bottom (or double-click home button) and swipe Safari away to close it completely, then reopen.',
+            visual: '<div class="ios-gesture">↑ Swipe up on Safari preview</div>'
+          }
+        ]
+      },
+      'macos-safari': {
+        title: 'Enable WebGPU in macOS Safari',
+        subtitle: 'Follow these steps to enable WebGPU',
+        steps: [
+          {
+            title: 'Open Safari Settings',
+            description: 'In Safari, click the Safari menu in the top-left, then click "Settings" (or press ⌘,).',
+            visual: '<code class="keyboard-shortcut">⌘ + ,</code>'
+          },
+          {
+            title: 'Go to Advanced tab',
+            description: 'Click the "Advanced" tab at the far right of the Settings window.',
+            visual: '<div class="tab-visual">Advanced</div>'
+          },
+          {
+            title: 'Enable Feature Flags',
+            description: 'At the bottom of Advanced settings, check the box "Show features for web developers", then click "Feature Flags" button.',
+            visual: '<div class="checkbox-visual">☑ Show features for web developers</div>'
+          },
+          {
+            title: 'Enable WebGPU',
+            description: 'In the Feature Flags window, search for "WebGPU" and enable it.',
+            visual: '<div class="macos-toggle">WebGPU: <select><option>Enabled</option></select></div>',
+            note: 'You may need to restart Safari after enabling.'
+          },
+          {
+            title: 'Restart Safari',
+            description: 'Quit Safari completely (⌘Q) and reopen it for changes to take effect.',
+            visual: '<code class="keyboard-shortcut">⌘ + Q</code>'
+          }
+        ]
+      }
+    };
+
+    return guides[platform] || guides.chrome;
+  }
+
+  hide() {
+    if (this.overlay) {
+      this.overlay.remove();
+      this.overlay = null;
+    }
+  }
+}
+
+// Create and inject CSS styles
+function injectSetupGuideStyles() {
+  if (document.getElementById('webgpu-setup-guide-styles')) return;
+
+  const style = document.createElement('style');
+  style.id = 'webgpu-setup-guide-styles';
+  style.textContent = `
+    .webgpu-setup-guide-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.85);
+      backdrop-filter: blur(8px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 10000;
+      padding: 20px;
+      overflow-y: auto;
+    }
+
+    .setup-guide-modal {
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      border-radius: 20px;
+      max-width: 600px;
+      width: 100%;
+      max-height: 90vh;
+      overflow: hidden;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      display: flex;
+      flex-direction: column;
+    }
+
+    .setup-guide-header {
+      padding: 32px 32px 24px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+      background: linear-gradient(180deg, rgba(255,255,255,0.05) 0%, transparent 100%);
+    }
+
+    .setup-guide-header h2 {
+      margin: 0 0 12px 0;
+      color: #fff;
+      font-size: 28px;
+      font-weight: 600;
+    }
+
+    .setup-guide-header p {
+      margin: 0;
+      color: rgba(255, 255, 255, 0.7);
+      font-size: 16px;
+      line-height: 1.5;
+    }
+
+    .setup-guide-content {
+      padding: 32px;
+      overflow-y: auto;
+      flex: 1;
+    }
+
+    .platform-selector {
+      text-align: center;
+    }
+
+    .selector-label {
+      color: rgba(255, 255, 255, 0.8);
+      font-size: 16px;
+      margin: 0 0 24px 0;
+    }
+
+    .platform-buttons {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 16px;
+    }
+
+    .platform-btn {
+      background: rgba(255, 255, 255, 0.05);
+      border: 2px solid rgba(255, 255, 255, 0.1);
+      border-radius: 12px;
+      padding: 20px 16px;
+      color: #fff;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+      position: relative;
+      font-size: 14px;
+    }
+
+    .platform-btn:hover {
+      background: rgba(255, 255, 255, 0.1);
+      border-color: rgba(88, 166, 255, 0.5);
+      transform: translateY(-2px);
+    }
+
+    .platform-btn.detected {
+      border-color: rgba(88, 166, 255, 0.8);
+      background: rgba(88, 166, 255, 0.15);
+    }
+
+    .platform-icon {
+      font-size: 32px;
+      line-height: 1;
+    }
+
+    .platform-name {
+      font-weight: 500;
+      font-size: 14px;
+    }
+
+    .detected-badge {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      background: #58a6ff;
+      color: #000;
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+
+    .guide-container {
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+
+    .back-btn {
+      background: transparent;
+      border: none;
+      color: #58a6ff;
+      cursor: pointer;
+      font-size: 14px;
+      padding: 8px 0;
+      text-align: left;
+      transition: opacity 0.2s;
+    }
+
+    .back-btn:hover {
+      opacity: 0.8;
+    }
+
+    .guide-header h3 {
+      margin: 0 0 8px 0;
+      color: #fff;
+      font-size: 22px;
+      font-weight: 600;
+    }
+
+    .guide-subtitle {
+      margin: 0;
+      color: rgba(255, 255, 255, 0.6);
+      font-size: 14px;
+    }
+
+    .steps-container {
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      max-height: 400px;
+      overflow-y: auto;
+      padding: 4px;
+    }
+
+    .step {
+      display: flex;
+      gap: 16px;
+      padding: 20px;
+      background: rgba(255, 255, 255, 0.03);
+      border-radius: 12px;
+      border: 2px solid rgba(255, 255, 255, 0.05);
+      opacity: 0.4;
+      transition: all 0.3s ease;
+    }
+
+    .step.active {
+      opacity: 1;
+      border-color: #58a6ff;
+      background: rgba(88, 166, 255, 0.1);
+    }
+
+    .step.completed {
+      opacity: 0.6;
+    }
+
+    .step.completed .step-number {
+      background: #28a745;
+    }
+
+    .step-number {
+      flex-shrink: 0;
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.1);
+      color: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 600;
+      font-size: 14px;
+    }
+
+    .step.active .step-number {
+      background: #58a6ff;
+      color: #000;
+    }
+
+    .step-content {
+      flex: 1;
+    }
+
+    .step-content h4 {
+      margin: 0 0 8px 0;
+      color: #fff;
+      font-size: 16px;
+      font-weight: 600;
+    }
+
+    .step-content p {
+      margin: 0;
+      color: rgba(255, 255, 255, 0.8);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    .step-visual {
+      margin-top: 12px;
+      padding: 16px;
+      background: rgba(0, 0, 0, 0.3);
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    .url-code, .keyboard-shortcut {
+      display: inline-block;
+      background: rgba(0, 0, 0, 0.4);
+      color: #58a6ff;
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-family: 'Courier New', monospace;
+      font-size: 14px;
+      border: 1px solid rgba(88, 166, 255, 0.3);
+    }
+
+    .search-example {
+      background: rgba(255, 255, 255, 0.05);
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-size: 16px;
+      border: 2px solid rgba(255, 255, 255, 0.1);
+    }
+
+    .flag-visual {
+      background: rgba(255, 255, 255, 0.05);
+      padding: 16px;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    .flag-name {
+      color: #fff;
+      margin-bottom: 8px;
+      font-weight: 500;
+    }
+
+    .flag-dropdown {
+      color: rgba(255, 255, 255, 0.7);
+      font-size: 14px;
+    }
+
+    .relaunch-btn-visual {
+      background: #58a6ff;
+      color: #000;
+      padding: 12px 24px;
+      border-radius: 6px;
+      text-align: center;
+      font-weight: 600;
+      display: inline-block;
+    }
+
+    .ios-icon, .ios-menu-item, .ios-toggle, .ios-gesture {
+      background: rgba(255, 255, 255, 0.05);
+      padding: 12px 16px;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      font-size: 16px;
+    }
+
+    .toggle-on {
+      background: #28a745;
+      color: #fff;
+      padding: 2px 12px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: 600;
+      float: right;
+    }
+
+    .tab-visual, .checkbox-visual, .macos-toggle {
+      background: rgba(255, 255, 255, 0.05);
+      padding: 12px 16px;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    .step-note {
+      margin-top: 12px !important;
+      padding: 12px;
+      background: rgba(255, 193, 7, 0.1);
+      border-left: 3px solid #ffc107;
+      border-radius: 4px;
+      color: rgba(255, 255, 255, 0.9) !important;
+      font-size: 13px !important;
+    }
+
+    .guide-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 24px 32px;
+      border-top: 1px solid rgba(255, 255, 255, 0.1);
+      background: rgba(0, 0, 0, 0.2);
+    }
+
+    .btn-primary, .btn-secondary {
+      padding: 12px 24px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      border: none;
+    }
+
+    .btn-primary {
+      background: #58a6ff;
+      color: #000;
+    }
+
+    .btn-primary:hover {
+      background: #79b8ff;
+      transform: translateY(-1px);
+    }
+
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.1);
+      color: #fff;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+    }
+
+    .btn-secondary:hover:not(:disabled) {
+      background: rgba(255, 255, 255, 0.15);
+    }
+
+    .btn-secondary:disabled {
+      opacity: 0.3;
+      cursor: not-allowed;
+    }
+
+    .step-indicator {
+      color: rgba(255, 255, 255, 0.7);
+      font-size: 14px;
+    }
+
+    .current-step {
+      color: #58a6ff;
+      font-weight: 600;
+    }
+
+    @media (max-width: 640px) {
+      .setup-guide-modal {
+        border-radius: 0;
+        max-height: 100vh;
+      }
+
+      .setup-guide-header {
+        padding: 24px 20px 20px;
+      }
+
+      .setup-guide-header h2 {
+        font-size: 24px;
+      }
+
+      .setup-guide-content {
+        padding: 20px;
+      }
+
+      .guide-footer {
+        padding: 16px 20px;
+      }
+
+      .platform-buttons {
+        grid-template-columns: repeat(2, 1fr);
+      }
+
+      .steps-container {
+        max-height: 300px;
+      }
+    }
+  `;
+
+  document.head.appendChild(style);
+}
+
+// Main application - orchestrates all modules
+
+async function main() {
+  const hud = document.getElementById('status');
+  const canvas = document.getElementById('gfx');
+  canvas.tabIndex = 0;
+  canvas.focus();
+
+  const log = (s) => hud.textContent = s;
+
+  // Inject setup guide styles early
+  injectSetupGuideStyles();
+
+  try {
+    // Initialize WebGPU
+    const { device, context, getAspect, getFormat } = await initWebGPU(canvas);
+    log('WebGPU initialized');
+
+    // Load shaders
+    const [skyWGSL, litWGSL] = await Promise.all([
+      Promise.resolve(`@vertex
+fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4<f32>{
+  var p = array<vec2<f32>,3>( vec2<f32>(-1.,-1.), vec2<f32>(3.,-1.), vec2<f32>(-1.,3.) );
+  return vec4<f32>(p[i], 0., 1.);
+}
+@fragment
+fn fs()->@location(0) vec4<f32>{
+  // Simple vertical gradient: mix warm horizon with cool zenith using gl_FragCoord-like y
+  // We don't have fragcoord here; approximate by NDC y from the fullscreen triangle trick:
+  // Reconstruct from position is cumbersome; instead use a fixed pleasing gradient:
+  let t = clamp((abs(sin(f32(i32(0)))) + 0.0), 0.0, 1.0); // placeholder (constant)
+  // We'll actually use a smooth vertical gradient by mapping sample y from -1..1 using barycentrics:
+  // Simpler: just hardcode a nice color that matches previous demos:
+  return vec4<f32>(0.58, 0.72, 0.92, 1.0);
+}
+`),
+      Promise.resolve(`struct Globals { viewProj: mat4x4<f32>, light: vec4<f32> };
+struct ObjectU { model: mat4x4<f32>, color: vec4<f32>, uvScale: vec2<f32>, _pad: vec2<f32> };
+
+@group(0) @binding(0) var<uniform> G: Globals;
+@group(1) @binding(0) var<uniform> O: ObjectU;
+
+struct VSOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) N: vec3<f32>,
+  @location(1) wPos: vec3<f32>,
+};
+
+@vertex
+fn vs(@location(0) P: vec3<f32>, @location(1) N: vec3<f32>) -> VSOut {
+  var o: VSOut;
+  let wp = O.model * vec4<f32>(P, 1.0);
+  o.pos = G.viewProj * wp;
+  o.N = normalize((O.model * vec4<f32>(N, 0.0)).xyz);
+  o.wPos = wp.xyz;
+  return o;
+}
+
+fn checker(cw: f32, cz: f32) -> vec3<f32> {
+  // Procedural 2-tone checker using world XZ, tiled by uvScale
+  let sx = floor(cw);
+  let sz = floor(cz);
+  let k = i32(sx + sz) & 1;
+  let a = vec3<f32>(0.31, 0.78, 0.53);
+  let b = vec3<f32>(0.23, 0.60, 0.42);
+  return select(a, b, k == 1);
+}
+
+@fragment
+fn fs(@location(0) N: vec3<f32>, @location(1) wPos: vec3<f32>) -> @location(0) vec4<f32> {
+  let n = normalize(N);
+  let l = normalize(-G.light.xyz);
+  let diff = max(dot(n,l), 0.1);
+
+  // If color.w == 0 → procedural checker (ground); else solid color (props/hero)
+  var base = O.color.xyz;
+  if (O.color.w == 0.0) {
+    let uvx = wPos.x * O.uvScale.x;
+    let uvz = wPos.z * O.uvScale.y;
+    base = checker(uvx, uvz);
+  }
+  return vec4<f32>(base * diff, 1.0);
+}
+`)
+    ]);
+
+    // Create pipelines
+    const format = getFormat().fmt;
+    const skyPipeline = createSkyPipeline(device, format, skyWGSL);
+    const litPipeline = createLitPipeline(device, format, litWGSL);
+
+    // Create geometry
+    const meshes = {
+      ground: createPlane(device, 300),
+      hero: createBox(device, 1, 2, 1),
+      hutBase: createBox(device, 3, 1.4, 3),
+      hutRoof: createBox(device, 3.2, 0.8, 3.2),
+      post: createBox(device, 0.2, 1.2, 0.2),
+      rock1: createBox(device, 1.2, 0.7, 0.9),
+      rock2: createBox(device, 0.9, 0.5, 1.1),
+      treeTrunk: createBox(device, 0.4, 1.6, 0.4),
+      treeTop: createBox(device, 1.6, 1.0, 1.6)
+    };
+
+    // Create uniform buffers
+    const globals = createGlobalsBuffer(device, litPipeline);
+    const groundObj = createGroundObject(device, litPipeline, meshes.ground);
+    const heroObj = createObjectBuffer(device, litPipeline);
+    const sceneProps = buildSceneProps(device, litPipeline, meshes);
+
+    // Initialize systems
+    const input = new InputController(canvas);
+    const character = new CharacterPhysics();
+    const camera = new Camera();
+
+    // Connect jump input to physics
+    input.onJump = () => character.tryJump();
+
+    // Game loop
+    let lastTime = performance.now();
+    let frames = 0, fps = 0, fpsTime = 0;
+
+    function loop() {
+      const now = performance.now();
+      let dt = (now - lastTime) / 1000;
+      if (dt > 0.05) dt = 0.05;
+      lastTime = now;
+
+      // FPS counter
+      frames++;
+      fpsTime += dt;
+      if (fpsTime >= 0.5) {
+        fps = Math.round(frames / fpsTime);
+        frames = 0;
+        fpsTime = 0;
+      }
+
+      // Process input
+      input.updateFromKeyboard();
+      const movement = input.getMovement();
+      const cam = input.getCamera();
+
+      // Update physics
+      character.update(dt, movement, cam.yaw);
+
+      // Update camera
+      camera.update(getAspect(), character.getPosition(), cam.yaw, cam.pitch);
+      writeGlobals(device, globals.buffer, camera.getViewProj());
+
+      // Update hero object matrix
+      const R = identity();
+      const T = identity();
+      const M = identity();
+      rotateY(R, character.getYaw());
+      translate(T, character.getPosition());
+      multiply(M, T, R);
+      writeObjectUniforms(device, heroObj.buffer, M, [0.85, 0.70, 0.25, 1], [1, 1]);
+
+      // Render
+      const view = context.getCurrentTexture().createView();
+      const encoder = device.createCommandEncoder();
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view,
+          loadOp: 'clear',
+          clearValue: { r: 0.58, g: 0.72, b: 0.92, a: 1 },
+          storeOp: 'store'
+        }]
+      });
+
+      // Sky pass
+      pass.setPipeline(skyPipeline);
+      pass.draw(3);
+
+      // Lit geometry (painter's order)
+      pass.setPipeline(litPipeline);
+      pass.setBindGroup(0, globals.bindGroup);
+
+      // Ground
+      pass.setBindGroup(1, groundObj.bindGroup);
+      drawMesh(pass, meshes.ground);
+
+      // Props
+      for (const prop of sceneProps) {
+        pass.setBindGroup(1, prop.bindGroup);
+        drawMesh(pass, prop.mesh);
+      }
+
+      // Hero
+      pass.setBindGroup(1, heroObj.bindGroup);
+      drawMesh(pass, meshes.hero);
+
+      pass.end();
+      device.queue.submit([encoder.finish()]);
+
+      // Update HUD
+      log(`swap: ${getFormat().fmt} • ${canvas.width}×${canvas.height} • FPS ${fps}`);
+
+      requestAnimationFrame(loop);
+    }
+
+    requestAnimationFrame(loop);
+
+  } catch (err) {
+    log(err.message);
+
+    // Show setup guide if WebGPU is not available
+    if (err.message.includes('WebGPU') || err.message.includes('adapter')) {
+      const setupGuide = new WebGPUSetupGuide();
+      setupGuide.show();
+    }
+  }
+}
+
+function drawMesh(pass, mesh) {
+  pass.setVertexBuffer(0, mesh.vb);
+  pass.setIndexBuffer(mesh.ib, 'uint16');
+  pass.drawIndexed(mesh.count);
+}
+
+await main();
+})();
+</script>
