@@ -9,6 +9,7 @@ import { CharacterPhysics } from './physics/character.js';
 import { Camera } from './rendering/camera.js';
 import { buildSceneProps, createGroundObject } from './scene/props.js';
 import { identity, rotateY, translate, multiply } from './math/matrix.js';
+import { WebGPUSetupGuide, injectSetupGuideStyles } from './ui/setup-guide.js';
 
 export async function main() {
   const hud = document.getElementById('status');
@@ -17,6 +18,9 @@ export async function main() {
   canvas.focus();
 
   const log = (s) => hud.textContent = s;
+
+  // Inject setup guide styles early
+  injectSetupGuideStyles();
 
   try {
     // Initialize WebGPU
@@ -148,6 +152,12 @@ export async function main() {
 
   } catch (err) {
     log(err.message);
+
+    // Show setup guide if WebGPU is not available
+    if (err.message.includes('WebGPU') || err.message.includes('adapter')) {
+      const setupGuide = new WebGPUSetupGuide();
+      setupGuide.show();
+    }
   }
 }
 
